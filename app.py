@@ -16,7 +16,10 @@ ACCESS_TOKEN     = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN     = "Sunflower@2618"
 
-MONGO_URI        = os.getenv("MONGO_URI")
+MONGO_URI        = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://sudharsan2618_db_user:ZdMsUJRvEqeaUsZj@tatti.gjcwmg8.mongodb.net/?appName=Tatti"
+)
 
 # ── MongoDB Setup ─────────────────────────────────────────────────────────────
 
