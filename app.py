@@ -73,6 +73,7 @@ VERIFY_TOKEN           = "Sunflower@2618"
 MONGO_URI              = os.getenv("MONGO_URI")
 PRIVATE_KEY_PATH       = os.getenv("PRIVATE_KEY_PATH", "./private.pem")
 PRIVATE_KEY_PASSPHRASE = os.getenv("PRIVATE_KEY_PASSPHRASE", "")
+PRIVATE_KEY_CONTENT    = os.getenv("PRIVATE_KEY_CONTENT")  # optional (production)
 
 # ── MongoDB Setup ─────────────────────────────────────────────────────────────
 
@@ -88,19 +89,23 @@ print("✅ Connected to MongoDB — db: whatsapp-automation, collection: flow_le
 # ── Encryption Helpers ────────────────────────────────────────────────────────
 
 def load_private_key():
-    """
-    Load the RSA private key from disk.
-    PRIVATE_KEY_PATH must point to your private.pem file.
-    PRIVATE_KEY_PASSPHRASE is the password you set when running openssl genrsa.
-    Leave PRIVATE_KEY_PASSPHRASE empty in .env if you generated a key without a password.
-    """
-    with open(PRIVATE_KEY_PATH, "rb") as f:
-        passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
+    passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
+
+    if PRIVATE_KEY_CONTENT:
+        # Load from env var (Render/production)
         return load_pem_private_key(
-            f.read(),
+            PRIVATE_KEY_CONTENT.encode(),
             password=passphrase,
             backend=default_backend()
         )
+    else:
+        # Fallback: load from file (local dev only)
+        with open("./private.pem", "rb") as f:
+            return load_pem_private_key(
+                f.read(),
+                password=passphrase,
+                backend=default_backend()
+            )
 
 
 def decrypt_flow_request(encrypted_flow_data: str, encrypted_aes_key: str, initial_vector: str) -> dict:
