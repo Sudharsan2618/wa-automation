@@ -92,9 +92,10 @@ def load_private_key():
     passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
 
     if PRIVATE_KEY_CONTENT:
-        # Load from env var (Render/production)
+        # Render strips real newlines from env vars — unescape \n back to actual newlines
+        pem = PRIVATE_KEY_CONTENT.replace("\\n", "\n").encode()
         return load_pem_private_key(
-            PRIVATE_KEY_CONTENT.encode(),
+            pem,
             password=passphrase,
             backend=default_backend()
         )
