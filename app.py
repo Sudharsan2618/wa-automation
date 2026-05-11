@@ -24,6 +24,24 @@ Flow response_json keys (from TATTI Flow JSON complete action payload):
   full_name, email, qualification, current_status,
   preferred_batch, mode_of_study, category, degree, confirmed
   flow_token is also always included by Meta automatically.
+
+Flow Endpoint (/flow) — data_exchange action reference:
+  Request body (unencrypted mode):
+    version    → "3.0"
+    action     → "ping" | "init" | "data_exchange"
+    flow_token → unique token for this flow session
+    screen     → current screen ID (present on data_exchange)
+    data       → payload sent from the screen's on-click-action (present on data_exchange)
+
+  Response body (for data_exchange):
+    version    → echo back "3.0"
+    screen     → next screen ID to navigate to
+    data       → data object required by the next screen's `data` field declarations
+
+  NOTE: In production Meta encrypts the /flow request body.
+        This file handles UNENCRYPTED mode (development/testing).
+        To enable unencrypted mode in Meta:
+          Flow Builder → your flow → Settings → toggle off "Endpoint Encryption"
 """
 
 from flask import Flask, request, jsonify
@@ -40,12 +58,10 @@ app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-
-ACCESS_TOKEN     = os.getenv("ACCESS_TOKEN")
-PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
-VERIFY_TOKEN     = "Sunflower@2618"
-
-MONGO_URI = os.getenv("MONGO_URI")
+ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+VERIFY_TOKEN    = "Sunflower@2618"
+MONGO_URI       = os.getenv("MONGO_URI")
 
 # ── MongoDB Setup ─────────────────────────────────────────────────────────────
 
@@ -74,17 +90,23 @@ def get_contact_name(contacts: list, wa_phone: str) -> str:
     return ""
 
 
-def save_lead(message: dict, contacts: list, metadata: dict, flow_data: dict, raw_webhook: dict):
+def save_lead(
+    message: dict,
+    contacts: list,
+    metadata: dict,
+    flow_data: dict,
+    raw_webhook: dict,
+):
     """
     Build and insert the complete document into flow_leads.
 
     Top-level fields sourced directly from documented payload paths:
-      - wa_message_id   : messages[].id
-      - wa_phone        : messages[].from
-      - wa_display_name : contacts[].profile.name  (matched by wa_id)
+      - wa_message_id     : messages[].id
+      - wa_phone          : messages[].from
+      - wa_display_name   : contacts[].profile.name  (matched by wa_id)
       - message_timestamp : messages[].timestamp (unix string → stored as-is)
-      - phone_number_id : metadata.phone_number_id
-      - All flow fields from response_json (your TATTI complete action payload)
+      - phone_number_id   : metadata.phone_number_id
+      - All flow fields from response_json (TATTI complete action payload)
     """
     wa_phone = message.get("from", "")
 
@@ -92,7 +114,7 @@ def save_lead(message: dict, contacts: list, metadata: dict, flow_data: dict, ra
         # ── From messages[] ───────────────────────────────────────────────
         "wa_message_id"     : message.get("id"),
         "wa_phone"          : wa_phone,
-        "message_timestamp" : message.get("timestamp"),   # unix epoch string from Meta
+        "message_timestamp" : message.get("timestamp"),  # unix epoch string from Meta
 
         # ── From contacts[] ───────────────────────────────────────────────
         "wa_display_name"   : get_contact_name(contacts, wa_phone),
@@ -117,17 +139,133 @@ def save_lead(message: dict, contacts: list, metadata: dict, flow_data: dict, ra
         "received_at"       : datetime.now(timezone.utc),
 
         # ── Raw payloads (full audit trail) ───────────────────────────────
-        "raw_flow_payload"  : flow_data,       # parsed response_json dict
-        "raw_webhook"       : raw_webhook,     # complete Meta POST body
+        "raw_flow_payload"  : flow_data,    # parsed response_json dict
+        "raw_webhook"       : raw_webhook,  # complete Meta POST body
     }
 
     try:
         leads_col.insert_one(doc)
-        print(f"✅ Lead saved → name={doc.get('full_name')} | phone={wa_phone} | degree={doc.get('degree')} | confirmed={doc.get('confirmed')}")
+        print(
+            f"✅ Lead saved → "
+            f"name={doc.get('full_name')} | "
+            f"phone={wa_phone} | "
+            f"degree={doc.get('degree')} | "
+            f"confirmed={doc.get('confirmed')}"
+        )
     except DuplicateKeyError:
         print(f"⚠️  Duplicate ignored — message_id already stored: {message.get('id')}")
     except Exception as e:
         print(f"❌ MongoDB insert error: {e}")
+
+
+# ── Flow Endpoint — data_exchange ─────────────────────────────────────────────
+
+@app.route("/flow", methods=["POST"])
+def flow_endpoint():
+    """
+    WhatsApp Flow Endpoint — called by Meta mid-flow for data_exchange actions.
+
+    This is a SEPARATE endpoint from /webhook.
+    Register this URL in Meta: Flow Builder → your flow → Endpoint URL → <your-domain>/flow
+
+    Handles three action types:
+      ping          → Meta health check sent when you save the endpoint URL
+      init          → Sent when the flow is first opened by the user
+      data_exchange → Sent when a screen's footer uses "name": "data_exchange"
+                      Currently fired from the CATEGORY screen.
+
+    Routing logic (CATEGORY data_exchange):
+      category == "degree"                          → DEGREE_SELECTION
+      category in skill/internship/study_abroad/other → CONFIRMATION (skip degree screens)
+
+    IMPORTANT — routing_model in your flow JSON must allow all target screens:
+      "CATEGORY": ["DEGREE_SELECTION", "CONFIRMATION"]   ← add CONFIRMATION here
+    """
+    body = request.get_json(silent=True) or {}
+
+    print("=" * 60)
+    print("📥 FLOW ENDPOINT POST received:")
+    print(json.dumps(body, indent=2))
+    print("=" * 60)
+
+    version    = body.get("version", "3.0")
+    action     = body.get("action", "")
+    screen     = body.get("screen", "")
+    flow_token = body.get("flow_token", "")
+    data       = body.get("data", {})
+
+    # ── 1. Ping — Meta health check ───────────────────────────────────────────
+    # Meta pings your endpoint when you first save its URL in the Flow Builder.
+    # Must respond with {"version": "3.0", "data": {"status": "active"}}
+    if action == "ping":
+        print("🏓 Ping received — responding active")
+        return jsonify({
+            "version": version,
+            "data": {"status": "active"}
+        }), 200
+
+    # ── 2. Init — flow opened by user ─────────────────────────────────────────
+    # Sent once when the flow opens. Since WELCOME is fully static with no
+    # dynamic data, we return an empty data object — no screen navigation needed.
+    if action == "init":
+        print("🚀 Init received — flow opened (static WELCOME, returning empty data)")
+        return jsonify({
+            "version": version,
+            "data": {}
+        }), 200
+
+    # ── 3. data_exchange from CATEGORY screen ─────────────────────────────────
+    # Fired when the user taps "Continue" on the CATEGORY screen.
+    # Payload contains all fields collected up to that point.
+    # We decide which screen to show next based on the selected category.
+    if action == "data_exchange" and screen == "CATEGORY":
+        category = data.get("category", "")
+
+        print(
+            f"🔄 CATEGORY data_exchange — "
+            f"category={category} | "
+            f"name={data.get('full_name')} | "
+            f"email={data.get('email')}"
+        )
+
+        # Fields to forward to every possible next screen
+        # Must match the `data` declarations in the target screen exactly
+        forwarded_data = {
+            "full_name"       : data.get("full_name"),
+            "email"           : data.get("email"),
+            "qualification"   : data.get("qualification"),
+            "current_status"  : data.get("current_status"),
+            "preferred_batch" : data.get("preferred_batch"),
+            "mode_of_study"   : data.get("mode_of_study"),
+            "category"        : category,
+        }
+
+        if category == "degree":
+            # Show the degree picker screen
+            print("➡️  Routing to DEGREE_SELECTION")
+            return jsonify({
+                "version" : version,
+                "screen"  : "DEGREE_SELECTION",
+                "data"    : forwarded_data,
+            }), 200
+
+        else:
+            # skill / internship / study_abroad / other
+            # Skip degree-related screens — go straight to CONFIRMATION.
+            # "degree" must be included because CONFIRMATION's data block declares it.
+            print(f"➡️  Non-degree category '{category}' — routing straight to CONFIRMATION")
+            return jsonify({
+                "version" : version,
+                "screen"  : "CONFIRMATION",
+                "data"    : {**forwarded_data, "degree": ""},
+            }), 200
+
+    # ── Fallback — log and return gracefully ──────────────────────────────────
+    print(f"⚠️  Unhandled — action='{action}' | screen='{screen}'")
+    return jsonify({
+        "version" : version,
+        "data"    : {"error": f"unhandled action '{action}' on screen '{screen}'"},
+    }), 200
 
 
 # ── Webhook Routes ────────────────────────────────────────────────────────────
@@ -157,6 +295,10 @@ def webhook_listener():
     Per Meta docs, the same endpoint receives both:
       - value.messages[]  → actual user messages (what we want)
       - value.statuses[]  → delivery/read receipts (we skip these)
+
+    For TATTI flows, this fires once the user hits Submit on the CONFIRMATION
+    screen (the "complete" action). The full flow payload arrives inside
+    messages[].interactive.nfm_reply.response_json as a JSON string.
     """
     raw_webhook = request.get_json(silent=True) or {}
 
@@ -173,20 +315,28 @@ def webhook_listener():
 
             # Per docs: changes is a list inside each entry
             for change in entry.get("changes", []):
-                field = change.get("field")   # should always be "messages"
-                value = change.get("value", {})
+                field    = change.get("field")  # should always be "messages"
+                value    = change.get("value", {})
 
                 metadata = value.get("metadata", {})
-                contacts = value.get("contacts", [])   # user profile info
-                messages = value.get("messages", [])   # actual messages
-                statuses = value.get("statuses", [])   # delivery receipts
+                contacts = value.get("contacts", [])  # user profile info
+                messages = value.get("messages", [])  # actual messages
+                statuses = value.get("statuses", [])  # delivery receipts
 
-                print(f"🔍 WABA={waba_id} | field={field} | messages={len(messages)} | statuses={len(statuses)}")
+                print(
+                    f"🔍 WABA={waba_id} | field={field} | "
+                    f"messages={len(messages)} | statuses={len(statuses)}"
+                )
 
-                # ── Skip delivery/read receipts — they are NOT messages ───
+                # ── Skip delivery/read receipts — they are NOT messages ────
                 if statuses and not messages:
                     for s in statuses:
-                        print(f"   ↳ status event: id={s.get('id')} status={s.get('status')} recipient={s.get('recipient_id')}")
+                        print(
+                            f"   ↳ status event: "
+                            f"id={s.get('id')} "
+                            f"status={s.get('status')} "
+                            f"recipient={s.get('recipient_id')}"
+                        )
                     print("⏭️  Skipping — this is a status update, not a message")
                     continue
 
@@ -197,7 +347,12 @@ def webhook_listener():
                     msg_type = message.get("type")
                     msg_ts   = message.get("timestamp")
 
-                    print(f"📨 message: id={msg_id} | from={msg_from} | type={msg_type} | timestamp={msg_ts}")
+                    print(
+                        f"📨 message: id={msg_id} | "
+                        f"from={msg_from} | "
+                        f"type={msg_type} | "
+                        f"timestamp={msg_ts}"
+                    )
 
                     # Per docs: flow responses come as type="interactive"
                     if msg_type != "interactive":
@@ -210,7 +365,10 @@ def webhook_listener():
                     print(f"🔗 interactive.type = {interactive_type}")
 
                     if interactive_type != "nfm_reply":
-                        print(f"⏭️  Skipping — interactive.type is '{interactive_type}', not 'nfm_reply'")
+                        print(
+                            f"⏭️  Skipping — "
+                            f"interactive.type is '{interactive_type}', not 'nfm_reply'"
+                        )
                         continue
 
                     # Per docs: nfm_reply has name="flow", body="Sent", response_json=<JSON string>
