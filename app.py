@@ -89,25 +89,16 @@ print("✅ Connected to MongoDB — db: whatsapp-automation, collection: flow_le
 # ── Encryption Helpers ────────────────────────────────────────────────────────
 
 def load_private_key():
-    passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
-
     if PRIVATE_KEY_CONTENT:
-        # Render strips real newlines from env vars — unescape \n back to actual newlines
-        pem = PRIVATE_KEY_CONTENT.replace("\\n", "\n").encode()
+        pem = PRIVATE_KEY_CONTENT.replace("\\r\\n", "\n").replace("\\n", "\n").strip() + "\n"
         return load_pem_private_key(
-            pem,
-            password=passphrase,
+            pem.encode(),
+            password=None,
             backend=default_backend()
         )
     else:
-        # Fallback: load from file (local dev only)
-        with open("./private.pem", "rb") as f:
-            return load_pem_private_key(
-                f.read(),
-                password=passphrase,
-                backend=default_backend()
-            )
-
+        with open("./private_rsa.pem", "rb") as f:
+            return load_pem_private_key(f.read(), password=None, backend=default_backend())
 
 def decrypt_flow_request(encrypted_flow_data: str, encrypted_aes_key: str, initial_vector: str) -> dict:
     """
