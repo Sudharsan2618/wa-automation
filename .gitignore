@@ -1,3 +1,5 @@
 .env
 flow-message.py
 wa.json
+public.pem
+private.pem

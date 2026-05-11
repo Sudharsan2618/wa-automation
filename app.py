@@ -26,7 +26,7 @@ Flow response_json keys (from TATTI Flow JSON complete action payload):
   flow_token is also always included by Meta automatically.
 
 Flow Endpoint (/flow) — data_exchange action reference:
-  Request body (unencrypted mode):
+  Request body (decrypted):
     version    → "3.0"
     action     → "ping" | "init" | "data_exchange"
     flow_token → unique token for this flow session
@@ -38,8 +38,9 @@ Flow Endpoint (/flow) — data_exchange action reference:
     screen     → next screen ID to navigate to
     data       → data object required by the next screen's `data` field declarations
 
-  NOTE: In production Meta encrypts the /flow request body.
-        This file handles UNENCRYPTED mode (development/testing).
+  NOTE: In production Meta encrypts the /flow request body using your RSA public key.
+        This file handles BOTH encrypted (production) and unencrypted (dev/testing) modes.
+        Encryption is auto-detected based on whether "encrypted_flow_data" is present.
         To enable unencrypted mode in Meta:
           Flow Builder → your flow → Settings → toggle off "Endpoint Encryption"
 """
@@ -47,10 +48,18 @@ Flow Endpoint (/flow) — data_exchange action reference:
 from flask import Flask, request, jsonify
 import os
 import json
+import base64
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
+
+# ── Cryptography imports (required for encrypted mode) ────────────────────────
+from cryptography.hazmat.primitives.asymmetric.padding import OAEP, MGF1
+from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.hazmat.backends import default_backend
 
 load_dotenv()
 
@@ -58,10 +67,12 @@ app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-VERIFY_TOKEN    = "Sunflower@2618"
-MONGO_URI       = os.getenv("MONGO_URI")
+ACCESS_TOKEN           = os.getenv("ACCESS_TOKEN")
+PHONE_NUMBER_ID        = os.getenv("PHONE_NUMBER_ID")
+VERIFY_TOKEN           = "Sunflower@2618"
+MONGO_URI              = os.getenv("MONGO_URI")
+PRIVATE_KEY_PATH       = os.getenv("PRIVATE_KEY_PATH", "./private.pem")
+PRIVATE_KEY_PASSPHRASE = os.getenv("PRIVATE_KEY_PASSPHRASE", "")
 
 # ── MongoDB Setup ─────────────────────────────────────────────────────────────
 
@@ -74,7 +85,123 @@ leads_col.create_index("wa_message_id", unique=True, sparse=True)
 
 print("✅ Connected to MongoDB — db: whatsapp-automation, collection: flow_leads")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Encryption Helpers ────────────────────────────────────────────────────────
+
+def load_private_key():
+    """
+    Load the RSA private key from disk.
+    PRIVATE_KEY_PATH must point to your private.pem file.
+    PRIVATE_KEY_PASSPHRASE is the password you set when running openssl genrsa.
+    Leave PRIVATE_KEY_PASSPHRASE empty in .env if you generated a key without a password.
+    """
+    with open(PRIVATE_KEY_PATH, "rb") as f:
+        passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
+        return load_pem_private_key(
+            f.read(),
+            password=passphrase,
+            backend=default_backend()
+        )
+
+
+def decrypt_flow_request(encrypted_flow_data: str, encrypted_aes_key: str, initial_vector: str) -> dict:
+    """
+    Meta's Flow encryption scheme (AES-GCM + RSA-OAEP):
+
+      1. WhatsApp client generates a random AES-128-GCM key.
+      2. That AES key is RSA-OAEP encrypted with YOUR business public key → encrypted_aes_key.
+      3. The actual JSON request body is AES-GCM encrypted → encrypted_flow_data.
+      4. You decrypt the AES key with your RSA private key, then decrypt the body.
+
+    Args:
+        encrypted_flow_data : base64-encoded AES-GCM ciphertext (body + 16-byte auth tag)
+        encrypted_aes_key   : base64-encoded RSA-OAEP encrypted AES key
+        initial_vector      : base64-encoded 12-byte GCM nonce/IV
+
+    Returns:
+        Decrypted request body as a Python dict.
+
+    Raises:
+        Exception if decryption fails — caller should return HTTP 421.
+    """
+    private_key = load_private_key()
+
+    # Step 1: RSA-OAEP decrypt the AES key
+    aes_key = private_key.decrypt(
+        base64.b64decode(encrypted_aes_key),
+        OAEP(
+            mgf=MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None
+        )
+    )
+
+    # Step 2: Decode IV and ciphertext
+    iv             = base64.b64decode(initial_vector)
+    encrypted_data = base64.b64decode(encrypted_flow_data)
+
+    # Step 3: Split ciphertext and GCM auth tag (last 16 bytes)
+    encrypted_body = encrypted_data[:-16]
+    auth_tag       = encrypted_data[-16:]
+
+    # Step 4: AES-GCM decrypt
+    decryptor = Cipher(
+        algorithms.AES(aes_key),
+        modes.GCM(iv, auth_tag),
+        backend=default_backend()
+    ).decryptor()
+
+    decrypted_bytes = decryptor.update(encrypted_body) + decryptor.finalize()
+    return json.loads(decrypted_bytes.decode("utf-8"))
+
+
+def encrypt_flow_response(response_body: dict, encrypted_aes_key: str, initial_vector: str) -> str:
+    """
+    Encrypt the response back to Meta using the SAME AES key but a BIT-FLIPPED IV.
+
+    Meta's spec requires:
+      - Same AES key that was used to decrypt the request.
+      - IV = each byte of the original IV XOR 0xFF (all bits flipped).
+      - Response = base64( AES-GCM-ciphertext + 16-byte-auth-tag )
+
+    Args:
+        response_body       : Python dict to send back to Meta.
+        encrypted_aes_key   : base64 AES key from the original request (still RSA-encrypted).
+        initial_vector      : base64 IV from the original request.
+
+    Returns:
+        base64-encoded encrypted response string (plain text MIME type).
+    """
+    private_key = load_private_key()
+
+    # Decrypt the AES key again (same as in decrypt_flow_request)
+    aes_key = private_key.decrypt(
+        base64.b64decode(encrypted_aes_key),
+        OAEP(
+            mgf=MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None
+        )
+    )
+
+    # Flip every bit of the IV
+    iv         = base64.b64decode(initial_vector)
+    flipped_iv = bytes(b ^ 0xFF for b in iv)
+
+    # AES-GCM encrypt
+    encryptor = Cipher(
+        algorithms.AES(aes_key),
+        modes.GCM(flipped_iv),
+        backend=default_backend()
+    ).encryptor()
+
+    body_bytes     = json.dumps(response_body).encode("utf-8")
+    ciphertext     = encryptor.update(body_bytes) + encryptor.finalize()
+    auth_tag       = encryptor.tag
+
+    return base64.b64encode(ciphertext + auth_tag).decode("utf-8")
+
+
+# ── Webhook Helpers ───────────────────────────────────────────────────────────
 
 def get_contact_name(contacts: list, wa_phone: str) -> str:
     """
@@ -158,7 +285,7 @@ def save_lead(
         print(f"❌ MongoDB insert error: {e}")
 
 
-# ── Flow Endpoint — data_exchange ─────────────────────────────────────────────
+# ── Flow Endpoint ─────────────────────────────────────────────────────────────
 
 @app.route("/flow", methods=["POST"])
 def flow_endpoint():
@@ -167,6 +294,10 @@ def flow_endpoint():
 
     This is a SEPARATE endpoint from /webhook.
     Register this URL in Meta: Flow Builder → your flow → Endpoint URL → <your-domain>/flow
+
+    Encryption is auto-detected:
+      - If request body contains "encrypted_flow_data" → ENCRYPTED mode (production)
+      - Otherwise → UNENCRYPTED mode (development, encryption toggled off in Flow Builder)
 
     Handles three action types:
       ping          → Meta health check sent when you save the endpoint URL
@@ -180,12 +311,46 @@ def flow_endpoint():
 
     IMPORTANT — routing_model in your flow JSON must allow all target screens:
       "CATEGORY": ["DEGREE_SELECTION", "CONFIRMATION"]   ← add CONFIRMATION here
+
+    Error handling:
+      HTTP 421 → returned when decryption fails (Meta's expected error code for this)
     """
-    body = request.get_json(silent=True) or {}
+    raw_body = request.get_json(silent=True) or {}
 
     print("=" * 60)
-    print("📥 FLOW ENDPOINT POST received:")
-    print(json.dumps(body, indent=2))
+    print("📥 FLOW ENDPOINT POST received")
+
+    # ── Detect encrypted vs unencrypted mode ─────────────────────────────────
+    is_encrypted = "encrypted_flow_data" in raw_body
+
+    if is_encrypted:
+        print("🔐 Encrypted request detected — decrypting...")
+        try:
+            body = decrypt_flow_request(
+                raw_body["encrypted_flow_data"],
+                raw_body["encrypted_aes_key"],
+                raw_body["initial_vector"],
+            )
+            print("🔓 Decrypted request body:")
+            print(json.dumps(body, indent=2))
+        except Exception as e:
+            # Meta expects HTTP 421 when your endpoint fails to decrypt.
+            # This usually means the public key on Meta doesn't match your private key.
+            print(f"❌ Decryption failed: {e}")
+            return "", 421
+
+        # Keep the original encrypted fields so we can encrypt the response
+        aes_key_b64 = raw_body["encrypted_aes_key"]
+        iv_b64      = raw_body["initial_vector"]
+
+    else:
+        # Unencrypted dev mode — Flow Builder → Settings → Endpoint Encryption OFF
+        body        = raw_body
+        aes_key_b64 = None
+        iv_b64      = None
+        print("🔓 Unencrypted (dev mode):")
+        print(json.dumps(body, indent=2))
+
     print("=" * 60)
 
     version    = body.get("version", "3.0")
@@ -194,25 +359,40 @@ def flow_endpoint():
     flow_token = body.get("flow_token", "")
     data       = body.get("data", {})
 
+    # ── Helper: build and send response (encrypted or plain) ─────────────────
+    def send_response(response_dict: dict):
+        """
+        In encrypted mode: AES-GCM encrypt the response dict and return as plain text.
+        In unencrypted mode: return as normal JSON.
+        """
+        if is_encrypted:
+            encrypted_response = encrypt_flow_response(response_dict, aes_key_b64, iv_b64)
+            return app.response_class(
+                response=encrypted_response,
+                status=200,
+                mimetype="text/plain"
+            )
+        return jsonify(response_dict), 200
+
     # ── 1. Ping — Meta health check ───────────────────────────────────────────
     # Meta pings your endpoint when you first save its URL in the Flow Builder.
     # Must respond with {"version": "3.0", "data": {"status": "active"}}
     if action == "ping":
         print("🏓 Ping received — responding active")
-        return jsonify({
+        return send_response({
             "version": version,
             "data": {"status": "active"}
-        }), 200
+        })
 
     # ── 2. Init — flow opened by user ─────────────────────────────────────────
     # Sent once when the flow opens. Since WELCOME is fully static with no
     # dynamic data, we return an empty data object — no screen navigation needed.
     if action == "init":
         print("🚀 Init received — flow opened (static WELCOME, returning empty data)")
-        return jsonify({
+        return send_response({
             "version": version,
             "data": {}
-        }), 200
+        })
 
     # ── 3. data_exchange from CATEGORY screen ─────────────────────────────────
     # Fired when the user taps "Continue" on the CATEGORY screen.
@@ -228,8 +408,8 @@ def flow_endpoint():
             f"email={data.get('email')}"
         )
 
-        # Fields to forward to every possible next screen
-        # Must match the `data` declarations in the target screen exactly
+        # Fields to forward to every possible next screen.
+        # Must match the `data` declarations in the target screen exactly.
         forwarded_data = {
             "full_name"       : data.get("full_name"),
             "email"           : data.get("email"),
@@ -243,29 +423,29 @@ def flow_endpoint():
         if category == "degree":
             # Show the degree picker screen
             print("➡️  Routing to DEGREE_SELECTION")
-            return jsonify({
+            return send_response({
                 "version" : version,
                 "screen"  : "DEGREE_SELECTION",
                 "data"    : forwarded_data,
-            }), 200
+            })
 
         else:
             # skill / internship / study_abroad / other
             # Skip degree-related screens — go straight to CONFIRMATION.
             # "degree" must be included because CONFIRMATION's data block declares it.
             print(f"➡️  Non-degree category '{category}' — routing straight to CONFIRMATION")
-            return jsonify({
+            return send_response({
                 "version" : version,
                 "screen"  : "CONFIRMATION",
                 "data"    : {**forwarded_data, "degree": ""},
-            }), 200
+            })
 
     # ── Fallback — log and return gracefully ──────────────────────────────────
     print(f"⚠️  Unhandled — action='{action}' | screen='{screen}'")
-    return jsonify({
+    return send_response({
         "version" : version,
         "data"    : {"error": f"unhandled action '{action}' on screen '{screen}'"},
-    }), 200
+    })
 
 
 # ── Webhook Routes ────────────────────────────────────────────────────────────
