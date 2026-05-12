@@ -1,39 +1,51 @@
 """
 TATTI WhatsApp Flow Webhook — app.py
-Based strictly on Meta's documented Cloud API webhook payload structure.
 
-Save strategy (two-phase upsert by flow_token):
-  Phase 1 → /flow data_exchange (CATEGORY screen):
-             upsert with status="in_progress" immediately — data is never lost
-             even if the user drops off before completing the CONFIRMATION screen.
-  Phase 2 → /webhook nfm_reply (CONFIRMATION complete action):
-             upsert the SAME document (matched by flow_token) with degree,
-             confirmed, wa_phone, wa_message_id, wa_display_name, status="completed".
+═══════════════════════════════════════════════════════════════
+SAVE STRATEGY — Why we don't rely on /webhook for primary data
+═══════════════════════════════════════════════════════════════
+Meta's "complete" action POSTs to /webhook, but this call is
+unreliable on hosted platforms (Render cold starts, Meta retry
+windows, etc). Instead we use a two-phase upsert by flow_token:
 
+  Phase 1  ──  /flow  ──  COURSE_DETAILS  data_exchange
+    • Fired when user taps "Proceed" after reading course info.
+    • At this point we already have ALL meaningful data:
+        full_name, email, qualification, current_status, degree
+    • Saved immediately with status="in_progress".
+    • User is then routed to CONFIRMATION screen.
+
+  Phase 2  ──  /webhook  ──  CONFIRMATION  complete  (bonus)
+    • Fired when user taps "Submit" on CONFIRMATION.
+    • Adds: confirmed, wa_phone, wa_message_id, wa_display_name.
+    • Upserts the same document by flow_token → status="completed".
+    • If webhook never fires, Phase 1 data is still fully usable.
+
+Flow path (CATEGORY screen removed — only degree programmes):
+  WELCOME → LEAD_DETAILS → DEGREE_SELECTION → COURSE_DETAILS
+          → CONFIRMATION
+
+Updated LEAD_DETAILS fields:
+  qualification  : Group Studied in 12th
+                   (computer_maths | bio_maths | pure_science |
+                    commerce | ca | others)
+  current_status : student | parent
+  REMOVED        : preferred_batch, mode_of_study
+
+═══════════════════════════════════════════════════════════════
 Official webhook payload reference:
-  entry[].id                                    → WABA ID
-  entry[].changes[].field                       → always "messages"
-  entry[].changes[].value.messaging_product     → "whatsapp"
-  entry[].changes[].value.metadata.phone_number_id
-  entry[].changes[].value.metadata.display_phone_number
-  entry[].changes[].value.contacts[].wa_id      → user's WA ID
-  entry[].changes[].value.contacts[].profile.name → user's display name
-  entry[].changes[].value.messages[].id         → message ID (wamid...)
-  entry[].changes[].value.messages[].from       → user's phone number
-  entry[].changes[].value.messages[].timestamp  → unix timestamp (string)
-  entry[].changes[].value.messages[].type       → "interactive" for flow replies
-  entry[].changes[].value.messages[].interactive.type        → "nfm_reply"
-  entry[].changes[].value.messages[].interactive.nfm_reply.name        → "flow"
-  entry[].changes[].value.messages[].interactive.nfm_reply.body        → "Sent"
-  entry[].changes[].value.messages[].interactive.nfm_reply.response_json → JSON string
-  entry[].changes[].value.statuses[]            → delivery/read receipts (skip these)
+  entry[].changes[].value.contacts[].wa_id      → user WA ID
+  entry[].changes[].value.contacts[].profile.name
+  entry[].changes[].value.messages[].id         → wamid
+  entry[].changes[].value.messages[].from       → phone number
+  entry[].changes[].value.messages[].timestamp
+  entry[].changes[].value.messages[].interactive.nfm_reply
+    .response_json                               → JSON string
+  entry[].changes[].value.statuses[]            → skip these
 
-Flow /flow endpoint decrypted request keys:
-  version, action (ping|init|data_exchange), flow_token, screen, data
-
-Flow response_json keys (TATTI complete action payload):
-  full_name, email, qualification, current_status,
-  preferred_batch, mode_of_study, category, degree, confirmed, flow_token
+/flow endpoint decrypted request keys:
+  version, action (ping | init | data_exchange),
+  flow_token, screen, data{}
 """
 
 from flask import Flask, request, jsonify
@@ -61,7 +73,7 @@ ACCESS_TOKEN           = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID        = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN           = "Sunflower@2618"
 MONGO_URI              = os.getenv("MONGO_URI")
-PRIVATE_KEY_PASSPHRASE = os.getenv("PRIVATE_KEY_PASSPHRASE", "")
+PRIVATE_KEY_PASSPHRASE = os.getenv("PRIVATE_KEY_PASSPHRASE", "")  # empty if key has no password
 
 # ── MongoDB Setup ─────────────────────────────────────────────────────────────
 
@@ -69,42 +81,58 @@ mongo_client = MongoClient(MONGO_URI)
 db           = mongo_client["whatsapp-automation"]
 leads_col    = db["flow_leads"]
 
-# sparse=True so in_progress docs (no wa_message_id yet) don't collide
+# sparse=True → in_progress docs (no wa_message_id yet) don't collide on the unique index
 leads_col.create_index("wa_message_id", unique=True, sparse=True)
 
-# Non-unique index on flow_token for fast upsert lookups in both phases
+# Non-unique — used as the upsert match key in both phases
 leads_col.create_index("flow_token")
 
-print("✅ Connected to MongoDB — db: whatsapp-automation, collection: flow_leads")
+print("✅ MongoDB connected — whatsapp-automation.flow_leads")
 
-# ── Encryption Helpers ────────────────────────────────────────────────────────
+# ── RSA / AES Encryption Helpers ─────────────────────────────────────────────
 
 def load_private_key():
+    """
+    Load RSA private key from ./private_rsa.pem.
+    Set PRIVATE_KEY_PASSPHRASE in .env if your key was generated with -des3.
+    Leave empty (default) if the key has no password.
+    """
     with open("./private_rsa.pem", "rb") as f:
-        return load_pem_private_key(f.read(), password=None, backend=default_backend())
+        passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
+        return load_pem_private_key(f.read(), password=passphrase, backend=default_backend())
 
-def decrypt_flow_request(encrypted_flow_data: str, encrypted_aes_key: str, initial_vector: str) -> dict:
+
+def decrypt_flow_request(
+    encrypted_flow_data: str,
+    encrypted_aes_key: str,
+    initial_vector: str,
+) -> dict:
     """
-    AES-GCM + RSA-OAEP decryption for Meta Flow encrypted requests.
+    Decrypt Meta's Flow endpoint request.
 
-    Steps:
-      1. RSA-OAEP-SHA256 decrypt the AES key using your private key.
-      2. AES-GCM decrypt the body using that AES key and the provided IV.
-      3. Last 16 bytes of encrypted_flow_data is the GCM auth tag.
+    Meta's scheme:
+      1. A random AES-128-GCM key is RSA-OAEP-SHA256 encrypted
+         with your business public key  →  encrypted_aes_key
+      2. The JSON body is AES-GCM encrypted  →  encrypted_flow_data
+         (last 16 bytes of the decoded value = GCM auth tag)
+      3. We reverse both steps using the RSA private key.
 
-    Raises Exception on failure — caller returns HTTP 421 to Meta.
+    Returns the decrypted body dict.
+    Raises on any failure — caller must return HTTP 421.
     """
-    private_key = load_private_key()
+    pk = load_private_key()
 
-    aes_key = private_key.decrypt(
+    # Step 1 — RSA-OAEP decrypt the AES key
+    aes_key = pk.decrypt(
         base64.b64decode(encrypted_aes_key),
         OAEP(mgf=MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None),
     )
 
+    # Step 2 — AES-GCM decrypt the body
     iv             = base64.b64decode(initial_vector)
-    encrypted_data = base64.b64decode(encrypted_flow_data)
-    encrypted_body = encrypted_data[:-16]   # everything before the last 16 bytes
-    auth_tag       = encrypted_data[-16:]   # last 16 bytes = GCM auth tag
+    raw            = base64.b64decode(encrypted_flow_data)
+    encrypted_body = raw[:-16]   # ciphertext
+    auth_tag       = raw[-16:]   # GCM authentication tag (always last 16 bytes)
 
     decryptor = Cipher(
         algorithms.AES(aes_key),
@@ -112,21 +140,27 @@ def decrypt_flow_request(encrypted_flow_data: str, encrypted_aes_key: str, initi
         backend=default_backend(),
     ).decryptor()
 
-    return json.loads((decryptor.update(encrypted_body) + decryptor.finalize()).decode("utf-8"))
+    plaintext = decryptor.update(encrypted_body) + decryptor.finalize()
+    return json.loads(plaintext.decode("utf-8"))
 
 
-def encrypt_flow_response(response_body: dict, encrypted_aes_key: str, initial_vector: str) -> str:
+def encrypt_flow_response(
+    response_body: dict,
+    encrypted_aes_key: str,
+    initial_vector: str,
+) -> str:
     """
-    AES-GCM encrypt the response back to Meta.
+    Encrypt the response back to Meta using the SAME AES key + bit-flipped IV.
 
-    Meta requires:
-      - Same AES key decrypted from the request.
-      - IV = original IV with every bit flipped (XOR 0xFF).
-      - Return value = base64( ciphertext + 16-byte GCM auth tag ).
+    Meta's spec:
+      - AES key: same as the request (decrypt with RSA private key first).
+      - IV: every byte XOR 0xFF (all bits flipped).
+      - Output: base64( ciphertext + 16-byte GCM auth tag )
+      - Content-Type of the HTTP response must be text/plain.
     """
-    private_key = load_private_key()
+    pk = load_private_key()
 
-    aes_key = private_key.decrypt(
+    aes_key = pk.decrypt(
         base64.b64decode(encrypted_aes_key),
         OAEP(mgf=MGF1(algorithm=SHA256()), algorithm=SHA256(), label=None),
     )
@@ -146,16 +180,23 @@ def encrypt_flow_response(response_body: dict, encrypted_aes_key: str, initial_v
     return base64.b64encode(ciphertext + encryptor.tag).decode("utf-8")
 
 
-# ── MongoDB Helpers ───────────────────────────────────────────────────────────
+# ── MongoDB Save Helpers ──────────────────────────────────────────────────────
 
-def upsert_partial_lead(flow_token: str, data: dict):
+def upsert_lead_from_flow(flow_token: str, data: dict):
     """
-    Phase 1 — called from /flow when CATEGORY data_exchange fires.
+    Phase 1 — PRIMARY SAVE.
+    Called from /flow when COURSE_DETAILS data_exchange fires.
 
-    Upserts by flow_token. Sets status="in_progress".
-    $setOnInsert is used for created_at so it only stamps on first insert.
-    This runs BEFORE we send the routing response to Meta so the data
-    is always persisted even if the user drops off mid-flow.
+    By COURSE_DETAILS we have ALL the fields we care about:
+      full_name, email, qualification, current_status, degree
+
+    Uses update_one + upsert=True keyed on flow_token so that:
+      • First call  → inserts a new document (status = in_progress).
+      • Retry calls → updates the same document without duplicating.
+
+    $setOnInsert writes created_at only on the very first insert.
+    This runs BEFORE we return the routing response to Meta, so
+    the data is persisted even if the user closes the flow immediately.
     """
     now = datetime.now(timezone.utc)
 
@@ -169,9 +210,7 @@ def upsert_partial_lead(flow_token: str, data: dict):
                     "email"           : data.get("email"),
                     "qualification"   : data.get("qualification"),
                     "current_status"  : data.get("current_status"),
-                    "preferred_batch" : data.get("preferred_batch"),
-                    "mode_of_study"   : data.get("mode_of_study"),
-                    "category"        : data.get("category"),
+                    "degree"          : data.get("degree"),
                     "status"          : "in_progress",
                     "last_updated_at" : now,
                 },
@@ -182,70 +221,80 @@ def upsert_partial_lead(flow_token: str, data: dict):
             upsert=True,
         )
 
-        if result.upserted_id:
-            print(f"✅ Phase 1 — new lead inserted (in_progress) → flow_token={flow_token} | name={data.get('full_name')} | category={data.get('category')}")
-        else:
-            print(f"✅ Phase 1 — lead updated (in_progress) → flow_token={flow_token}")
+        action = "inserted" if result.upserted_id else "updated"
+        print(
+            f"✅ Phase 1 ({action}) → "
+            f"flow_token={flow_token} | "
+            f"name={data.get('full_name')} | "
+            f"degree={data.get('degree')}"
+        )
 
     except Exception as e:
-        print(f"❌ upsert_partial_lead error: {e}")
+        # Log but don't raise — we still want to return the routing response
+        print(f"❌ upsert_lead_from_flow error: {e}")
 
 
 def get_contact_name(contacts: list, wa_phone: str) -> str:
-    """Match wa_id in contacts[] to get the display name."""
-    for contact in contacts:
-        if contact.get("wa_id") == wa_phone:
-            return contact.get("profile", {}).get("name", "")
-    if contacts:
-        return contacts[0].get("profile", {}).get("name", "")
-    return ""
+    """Return the WhatsApp display name for wa_phone from the contacts list."""
+    for c in contacts:
+        if c.get("wa_id") == wa_phone:
+            return c.get("profile", {}).get("name", "")
+    return contacts[0].get("profile", {}).get("name", "") if contacts else ""
 
 
-def complete_lead(message: dict, contacts: list, metadata: dict, flow_data: dict, raw_webhook: dict):
+def complete_lead_from_webhook(
+    message: dict,
+    contacts: list,
+    metadata: dict,
+    flow_data: dict,
+    raw_webhook: dict,
+):
     """
-    Phase 2 — called from /webhook when CONFIRMATION complete action fires.
+    Phase 2 — BONUS SAVE (best-effort).
+    Called from /webhook when CONFIRMATION complete action fires.
 
-    Upserts by flow_token — updates the Phase 1 document with the
-    remaining fields and sets status="completed".
-    If Phase 1 document is missing (edge case), inserts a full document.
+    Upserts by flow_token to update the Phase 1 document with:
+      confirmed, wa_phone, wa_message_id, wa_display_name,
+      phone_number_id, message_timestamp, status="completed",
+      and a full raw audit trail.
+
+    If Phase 1 doc is missing (edge case where /flow was never
+    called, or flow_token is absent) → inserts a complete document.
     """
     wa_phone   = message.get("from", "")
     flow_token = flow_data.get("flow_token", "")
     now        = datetime.now(timezone.utc)
 
     update_fields = {
-        # ── WhatsApp identity (only available from webhook) ───────────────
+        # ── WhatsApp identity (only available via webhook) ────────────────
         "wa_message_id"    : message.get("id"),
         "wa_phone"         : wa_phone,
         "wa_display_name"  : get_contact_name(contacts, wa_phone),
         "phone_number_id"  : metadata.get("phone_number_id"),
         "message_timestamp": message.get("timestamp"),
 
-        # ── Fields only available after CONFIRMATION screen ───────────────
-        "degree"           : flow_data.get("degree"),
+        # ── Final answer from CONFIRMATION screen ─────────────────────────
         "confirmed"        : flow_data.get("confirmed"),
 
-        # ── Re-set all earlier fields (covers case where Phase 1 was skipped)
+        # ── Re-assert all flow fields (handles Phase 1 missing edge case) ─
         "flow_token"       : flow_token,
         "full_name"        : flow_data.get("full_name"),
         "email"            : flow_data.get("email"),
         "qualification"    : flow_data.get("qualification"),
         "current_status"   : flow_data.get("current_status"),
-        "preferred_batch"  : flow_data.get("preferred_batch"),
-        "mode_of_study"    : flow_data.get("mode_of_study"),
-        "category"         : flow_data.get("category"),
+        "degree"           : flow_data.get("degree"),
 
         # ── Status + timestamps ───────────────────────────────────────────
         "status"           : "completed",
         "received_at"      : now,
         "last_updated_at"  : now,
 
-        # ── Raw audit trail ───────────────────────────────────────────────
+        # ── Full raw audit trail ──────────────────────────────────────────
         "raw_flow_payload" : flow_data,
         "raw_webhook"      : raw_webhook,
     }
 
-    # Match on flow_token if present; fall back to wa_message_id
+    # Prefer flow_token match; fall back to wa_message_id if token missing
     match_key = {"flow_token": flow_token} if flow_token else {"wa_message_id": message.get("id")}
 
     try:
@@ -259,53 +308,59 @@ def complete_lead(message: dict, contacts: list, metadata: dict, flow_data: dict
         )
 
         if result.upserted_id:
-            print(f"✅ Phase 2 — new completed lead inserted → name={flow_data.get('full_name')} | phone={wa_phone} | degree={flow_data.get('degree')} | confirmed={flow_data.get('confirmed')}")
+            print(
+                f"✅ Phase 2 (new doc) → "
+                f"name={flow_data.get('full_name')} | "
+                f"phone={wa_phone} | "
+                f"degree={flow_data.get('degree')} | "
+                f"confirmed={flow_data.get('confirmed')}"
+            )
         else:
-            print(f"✅ Phase 2 — existing lead completed → flow_token={flow_token} | degree={flow_data.get('degree')} | confirmed={flow_data.get('confirmed')}")
+            print(
+                f"✅ Phase 2 (updated) → "
+                f"flow_token={flow_token} | "
+                f"confirmed={flow_data.get('confirmed')}"
+            )
 
     except DuplicateKeyError:
-        print(f"⚠️  Duplicate ignored — wa_message_id already stored: {message.get('id')}")
+        print(f"⚠️  Duplicate — wa_message_id already stored: {message.get('id')}")
     except Exception as e:
-        print(f"❌ complete_lead error: {e}")
+        print(f"❌ complete_lead_from_webhook error: {e}")
 
 
-# ── Flow Endpoint ─────────────────────────────────────────────────────────────
+# ── /flow Endpoint ────────────────────────────────────────────────────────────
 
 @app.route("/flow", methods=["POST"])
 def flow_endpoint():
     """
-    WhatsApp Flow Endpoint — called by Meta mid-flow for data_exchange.
+    Meta calls this URL mid-flow whenever a screen has a data_exchange action.
 
-    Register in Meta: Flow Builder → your flow → Endpoint URL → <your-domain>/flow
+    Register at: Flow Builder → your flow → Endpoint URL → <domain>/flow
 
-    Handles:
-      ping          → Meta health check (save URL in Flow Builder)
-      init          → Flow opened by user (WELCOME is static, return empty data)
-      data_exchange → Footer tapped on CATEGORY screen
+    ┌─────────────────────────────────────────────────────┐
+    │  action = ping          →  health check response    │
+    │  action = init          →  flow opened (WELCOME)    │
+    │  action = data_exchange │                           │
+    │    screen = COURSE_DETAILS  →  PRIMARY SAVE + route │
+    │                             to CONFIRMATION         │
+    └─────────────────────────────────────────────────────┘
 
-    On data_exchange:
-      1. Saves partial lead to MongoDB (Phase 1) BEFORE responding.
-      2. Returns routing response to Meta.
+    Encryption auto-detected:
+      "encrypted_flow_data" key present  →  production (encrypted)
+      absent                              →  dev mode (plain JSON)
 
-    Routing:
-      category == "degree"  → DEGREE_SELECTION
-      category == anything else → CONFIRMATION (degree fields not needed)
-
-    Flow JSON routing_model must be:
-      "CATEGORY": ["DEGREE_SELECTION", "CONFIRMATION"]
-
-    HTTP 421 returned when decryption fails (Meta's expected error code).
+    HTTP 421 returned on decryption failure (Meta's required error code).
     """
     raw_body = request.get_json(silent=True) or {}
 
     print("=" * 60)
-    print("📥 FLOW ENDPOINT POST received")
+    print("📥 /flow POST received")
 
-    # ── Detect encrypted vs unencrypted mode ─────────────────────────────────
+    # ── Detect mode ───────────────────────────────────────────────────────────
     is_encrypted = "encrypted_flow_data" in raw_body
 
     if is_encrypted:
-        print("🔐 Encrypted request detected — decrypting...")
+        print("🔐 Encrypted — decrypting...")
         try:
             body        = decrypt_flow_request(
                 raw_body["encrypted_flow_data"],
@@ -314,11 +369,11 @@ def flow_endpoint():
             )
             aes_key_b64 = raw_body["encrypted_aes_key"]
             iv_b64      = raw_body["initial_vector"]
-            print("🔓 Decrypted request body:")
+            print("🔓 Decrypted body:")
             print(json.dumps(body, indent=2))
         except Exception as e:
             print(f"❌ Decryption failed: {e}")
-            return "", 421
+            return "", 421  # Meta expects exactly 421 on decryption failure
     else:
         body        = raw_body
         aes_key_b64 = None
@@ -329,105 +384,126 @@ def flow_endpoint():
     print("=" * 60)
 
     version    = body.get("version", "3.0")
-    action     = body.get("action", "")
+    action     = body.get("action", "").lower()
     screen     = body.get("screen", "")
     flow_token = body.get("flow_token", "")
     data       = body.get("data", {})
 
-    def send_response(response_dict: dict):
+    # ── Unified response helper ───────────────────────────────────────────────
+    def send_response(payload: dict):
+        """
+        Encrypt and return text/plain in production.
+        Return JSON in dev mode.
+        """
         if is_encrypted:
-            encrypted = encrypt_flow_response(response_dict, aes_key_b64, iv_b64)
-            return app.response_class(response=encrypted, status=200, mimetype="text/plain")
-        return jsonify(response_dict), 200
+            encrypted = encrypt_flow_response(payload, aes_key_b64, iv_b64)
+            return app.response_class(
+                response=encrypted,
+                status=200,
+                mimetype="text/plain",
+            )
+        return jsonify(payload), 200
 
-    # ── 1. Ping ───────────────────────────────────────────────────────────────
+    # ── 1. Ping — health check ────────────────────────────────────────────────
+    # Meta sends this when you save/update the endpoint URL in Flow Builder.
+    # Must reply {"version": "3.0", "data": {"status": "active"}} within ~3 s.
     if action == "ping":
-        print("🏓 Ping received — responding active")
+        print("🏓 Ping — responding active")
         return send_response({"version": version, "data": {"status": "active"}})
 
-    # ── 2. Init ───────────────────────────────────────────────────────────────
+    # ── 2. Init — flow opened ─────────────────────────────────────────────────
+    # Sent once when the user opens the flow. WELCOME is fully static so we
+    # return an empty data object — no navigation or dynamic content needed.
     if action == "init":
-        print("🚀 Init received — WELCOME is static, returning empty data")
+        print("🚀 Init — WELCOME is static, returning {}")
         return send_response({"version": version, "data": {}})
 
-    # ── 3. data_exchange — CATEGORY screen ───────────────────────────────────
-    if action == "data_exchange" and screen == "CATEGORY":
-        category = data.get("category", "")
-
+    # ── 3. data_exchange — COURSE_DETAILS screen ──────────────────────────────
+    # This is our PRIMARY SAVE POINT.
+    #
+    # Triggered when the user taps "Proceed" on COURSE_DETAILS.
+    # At this point the payload already contains every field we need:
+    #   full_name, email, qualification, current_status, degree
+    #
+    # We save to MongoDB FIRST (before replying), then route to CONFIRMATION.
+    # Even if the user closes WhatsApp after this, data is in the DB.
+    if action == "data_exchange" and screen == "COURSE_DETAILS":
         print(
-            f"🔄 CATEGORY data_exchange — "
-            f"category={category} | name={data.get('full_name')} | email={data.get('email')}"
+            f"🔄 COURSE_DETAILS data_exchange — "
+            f"name={data.get('full_name')} | "
+            f"email={data.get('email')} | "
+            f"degree={data.get('degree')}"
         )
 
-        # ── PHASE 1: Save to MongoDB BEFORE responding to Meta ────────────
-        upsert_partial_lead(flow_token, data)
+        # ── PRIMARY SAVE (Phase 1) — runs before we reply to Meta ────────
+        upsert_lead_from_flow(flow_token, data)
 
-        forwarded_data = {
-            "full_name"       : data.get("full_name"),
-            "email"           : data.get("email"),
-            "qualification"   : data.get("qualification"),
-            "current_status"  : data.get("current_status"),
-            "preferred_batch" : data.get("preferred_batch"),
-            "mode_of_study"   : data.get("mode_of_study"),
-            "category"        : category,
-        }
-
-        if category == "degree":
-            print("➡️  Routing → DEGREE_SELECTION")
-            return send_response({
-                "version": version,
-                "screen" : "DEGREE_SELECTION",
-                "data"   : forwarded_data,
-            })
-        else:
-            print(f"➡️  Non-degree '{category}' — routing → CONFIRMATION")
-            return send_response({
-                "version": version,
-                "screen" : "CONFIRMATION",
-                "data"   : {**forwarded_data, "degree": ""},
-            })
+        # ── Route to CONFIRMATION — pass all collected data through ───────
+        # CONFIRMATION's data block declares all these fields, so they must
+        # all be present in this response.
+        return send_response({
+            "version": version,
+            "screen" : "CONFIRMATION",
+            "data"   : {
+                "full_name"      : data.get("full_name"),
+                "email"          : data.get("email"),
+                "qualification"  : data.get("qualification"),
+                "current_status" : data.get("current_status"),
+                "degree"         : data.get("degree"),
+            },
+        })
 
     # ── Fallback ──────────────────────────────────────────────────────────────
     print(f"⚠️  Unhandled — action='{action}' | screen='{screen}'")
     return send_response({
         "version": version,
-        "data"   : {"error": f"unhandled action '{action}' on screen '{screen}'"},
+        "data"   : {"error": f"unhandled action='{action}' screen='{screen}'"},
     })
 
 
-# ── Webhook Routes ────────────────────────────────────────────────────────────
+# ── /webhook Endpoint — verification ─────────────────────────────────────────
 
 @app.route("/webhook", methods=["GET"])
 def verify():
-    """Meta GET to verify webhook. Must echo hub.challenge with 200."""
+    """
+    Meta sends a GET to verify the webhook URL.
+    Must echo hub.challenge as plain text with HTTP 200.
+    """
     mode      = request.args.get("hub.mode")
     token     = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook verified by Meta")
+        print("✅ Webhook verified")
         return challenge, 200
 
-    print(f"❌ Webhook verification failed — mode={mode} token={token}")
+    print(f"❌ Webhook verify failed — mode={mode} token={token}")
     return "Forbidden", 403
 
+
+# ── /webhook Endpoint — message events ───────────────────────────────────────
 
 @app.route("/webhook", methods=["POST"])
 def webhook_listener():
     """
-    Receives all WhatsApp Cloud API webhook events.
+    Receives all WhatsApp Cloud API events (messages + status updates).
 
-    For TATTI flows this fires when the user hits Submit on CONFIRMATION
-    (the "complete" action). Full payload is in:
+    For TATTI flows this fires when the user taps Submit on CONFIRMATION
+    (the "complete" action). The full payload is in:
       messages[].interactive.nfm_reply.response_json  (a JSON string)
 
-    This is Phase 2 of the save strategy — upserts the in_progress
-    document (created in Phase 1) with the final fields + status="completed".
+    This is Phase 2 (bonus save) — upserts the in_progress document
+    created in Phase 1 with confirmed + WhatsApp identity fields.
+
+    NOTE: Primary data is already saved in Phase 1 (/flow COURSE_DETAILS).
+    If this endpoint is never called, Phase 1 data is complete and usable.
+
+    Always returns HTTP 200 immediately — Meta retries on any other code.
     """
     raw_webhook = request.get_json(silent=True) or {}
 
     print("=" * 60)
-    print("📥 WEBHOOK POST received:")
+    print("📥 /webhook POST received:")
     print(json.dumps(raw_webhook, indent=2))
     print("=" * 60)
 
@@ -449,55 +525,65 @@ def webhook_listener():
                     f"messages={len(messages)} | statuses={len(statuses)}"
                 )
 
-                # Skip delivery/read receipts
+                # ── Skip delivery / read receipts ─────────────────────────
                 if statuses and not messages:
                     for s in statuses:
-                        print(f"   ↳ status: id={s.get('id')} status={s.get('status')} recipient={s.get('recipient_id')}")
-                    print("⏭️  Skipping — status update, not a message")
+                        print(
+                            f"   ↳ status: id={s.get('id')} "
+                            f"status={s.get('status')} "
+                            f"recipient={s.get('recipient_id')}"
+                        )
+                    print("⏭️  Status update — skipping")
                     continue
 
+                # ── Process messages ──────────────────────────────────────
                 for message in messages:
                     msg_id   = message.get("id")
                     msg_from = message.get("from")
                     msg_type = message.get("type")
                     msg_ts   = message.get("timestamp")
 
-                    print(f"📨 message: id={msg_id} | from={msg_from} | type={msg_type} | timestamp={msg_ts}")
+                    print(
+                        f"📨 id={msg_id} | from={msg_from} | "
+                        f"type={msg_type} | ts={msg_ts}"
+                    )
 
+                    # Flow replies come as type = "interactive"
                     if msg_type != "interactive":
-                        print(f"⏭️  Skipping — type '{msg_type}' is not 'interactive'")
+                        print(f"⏭️  type='{msg_type}' — not interactive, skipping")
                         continue
 
                     interactive      = message.get("interactive", {})
                     interactive_type = interactive.get("type")
-                    print(f"🔗 interactive.type = {interactive_type}")
+                    print(f"🔗 interactive.type={interactive_type}")
 
+                    # Flow replies specifically use nfm_reply
                     if interactive_type != "nfm_reply":
-                        print(f"⏭️  Skipping — interactive.type '{interactive_type}' is not 'nfm_reply'")
+                        print(f"⏭️  interactive.type='{interactive_type}' — not nfm_reply, skipping")
                         continue
 
                     nfm_reply         = interactive.get("nfm_reply", {})
-                    nfm_name          = nfm_reply.get("name")
-                    nfm_body          = nfm_reply.get("body")
                     response_json_str = nfm_reply.get("response_json", "{}")
 
-                    print(f"📋 nfm_reply.name={nfm_name} | body={nfm_body}")
-                    print(f"📋 response_json (raw): {response_json_str}")
+                    print(f"📋 nfm_reply.name={nfm_reply.get('name')} | body={nfm_reply.get('body')}")
+                    print(f"📋 response_json raw: {response_json_str}")
 
                     try:
                         flow_data = json.loads(response_json_str)
-                        print(f"✅ Parsed flow_data keys: {list(flow_data.keys())}")
+                        print(f"✅ flow_data keys: {list(flow_data.keys())}")
                     except json.JSONDecodeError as e:
-                        print(f"❌ Failed to parse response_json: {e}")
+                        print(f"❌ JSON parse error: {e}")
                         continue
 
-                    # ── PHASE 2: Complete the lead ────────────────────────
-                    complete_lead(message, contacts, metadata, flow_data, raw_webhook)
+                    # ── Phase 2 bonus save ────────────────────────────────
+                    complete_lead_from_webhook(
+                        message, contacts, metadata, flow_data, raw_webhook
+                    )
 
     except Exception as e:
         print(f"❌ Webhook processing error: {e}")
 
-    # Always return 200 — Meta retries on anything else
+    # Always 200 — Meta retries on anything else
     return jsonify({"status": "ok"}), 200
 
 
