@@ -102,32 +102,6 @@ def encrypt_flow_response(response_body, encrypted_aes_key, initial_vector):
     return base64.b64encode(ciphertext + encryptor.tag).decode("utf-8")
 
 
-# ── Prospectus PDF Helpers ────────────────────────────────────────────────────
-
-def upload_prospectus_pdf(pdf_path: str) -> str:
-    """
-    Upload the prospectus PDF to WhatsApp's media endpoint once.
-    Returns the media_id string.
-
-    WhatsApp media IDs for documents are permanent (they don't expire
-    the way session media does), so you only need to re-upload if the
-    file changes.  Store the returned id in PROSPECTUS_MEDIA_ID in your
-    .env so you don't re-upload on every server restart.
-    """
-    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/media"
-    with open(pdf_path, "rb") as f:
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-            data={"messaging_product": "whatsapp"},
-            files={"file": ("prospectus.pdf", f, "application/pdf")},
-        )
-    data = resp.json()
-    if "id" not in data:
-        raise RuntimeError(f"PDF upload failed: {data}")
-    print(f"✅ Prospectus uploaded — media_id={data['id']}")
-    print(f"   👉 Add this to your .env: PROSPECTUS_MEDIA_ID={data['id']}")
-    return data["id"]
 
 
 def send_prospectus(wa_phone: str, media_id: str):
