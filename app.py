@@ -1,53 +1,3 @@
-"""
-TATTI WhatsApp Flow Webhook — app.py
-
-═══════════════════════════════════════════════════════════════
-SAVE STRATEGY — Why we don't rely on /webhook for primary data
-═══════════════════════════════════════════════════════════════
-Meta's "complete" action POSTs to /webhook, but this call is
-unreliable on hosted platforms (Render cold starts, Meta retry
-windows, etc). Instead we use a two-phase upsert by flow_token:
-
-  Phase 1  ──  /flow  ──  COURSE_DETAILS  data_exchange
-    • Fired when user taps "Proceed" after reading course info.
-    • At this point we already have ALL meaningful data:
-        full_name, email, qualification, current_status, degree
-    • Saved immediately with status="in_progress".
-    • User is then routed to CONFIRMATION screen.
-
-  Phase 2  ──  /webhook  ──  CONFIRMATION  complete  (bonus)
-    • Fired when user taps "Submit" on CONFIRMATION.
-    • Adds: confirmed, wa_phone, wa_message_id, wa_display_name.
-    • Upserts the same document by flow_token → status="completed".
-    • If webhook never fires, Phase 1 data is still fully usable.
-
-Flow path (CATEGORY screen removed — only degree programmes):
-  WELCOME → LEAD_DETAILS → DEGREE_SELECTION → COURSE_DETAILS
-          → CONFIRMATION
-
-Updated LEAD_DETAILS fields:
-  qualification  : Group Studied in 12th
-                   (computer_maths | bio_maths | pure_science |
-                    commerce | ca | others)
-  current_status : student | parent
-  REMOVED        : preferred_batch, mode_of_study
-
-═══════════════════════════════════════════════════════════════
-Official webhook payload reference:
-  entry[].changes[].value.contacts[].wa_id      → user WA ID
-  entry[].changes[].value.contacts[].profile.name
-  entry[].changes[].value.messages[].id         → wamid
-  entry[].changes[].value.messages[].from       → phone number
-  entry[].changes[].value.messages[].timestamp
-  entry[].changes[].value.messages[].interactive.nfm_reply
-    .response_json                               → JSON string
-  entry[].changes[].value.statuses[]            → skip these
-
-/flow endpoint decrypted request keys:
-  version, action (ping | init | data_exchange),
-  flow_token, screen, data{}
-"""
-
 from flask import Flask, request, jsonify
 import os
 import json
@@ -92,14 +42,8 @@ print("✅ MongoDB connected — whatsapp-automation.flow_leads")
 # ── RSA / AES Encryption Helpers ─────────────────────────────────────────────
 
 def load_private_key():
-    """
-    Load RSA private key from ./private_rsa.pem.
-    Set PRIVATE_KEY_PASSPHRASE in .env if your key was generated with -des3.
-    Leave empty (default) if the key has no password.
-    """
     with open("./private_rsa.pem", "rb") as f:
-        passphrase = PRIVATE_KEY_PASSPHRASE.encode() if PRIVATE_KEY_PASSPHRASE else None
-        return load_pem_private_key(f.read(), password=passphrase, backend=default_backend())
+        return load_pem_private_key(f.read(), password=None, backend=default_backend())
 
 
 def decrypt_flow_request(
